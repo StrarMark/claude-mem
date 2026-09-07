@@ -1,21 +1,35 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
+import { readFlatSettings } from '../../src/npx-cli/utils/settings.js';
 
 describe('SettingsDefaultsManager', () => {
   let tempDir: string;
   let settingsPath: string;
+  let prevDataDirEnv: string | undefined;
 
   beforeEach(() => {
     tempDir = join(tmpdir(), `settings-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(tempDir, { recursive: true });
     settingsPath = join(tempDir, 'settings.json');
+
+    // The preload tripwire (tests/preload.ts) pins CLAUDE_MEM_DATA_DIR for
+    // the whole run, and loadFromFile applies env overrides on top of file
+    // values — which would make every loadFromFile result diverge from
+    // getAllDefaults()'s hardcoded ~/.claude-mem default. These tests are
+    // about file > defaults behavior on an EXPLICIT settingsPath (no real
+    // data-dir I/O happens here), so drop the env override for their
+    // duration and restore it after.
+    prevDataDirEnv = process.env.CLAUDE_MEM_DATA_DIR;
+    delete process.env.CLAUDE_MEM_DATA_DIR;
   });
 
   afterEach(() => {
+    if (prevDataDirEnv === undefined) delete process.env.CLAUDE_MEM_DATA_DIR;
+    else process.env.CLAUDE_MEM_DATA_DIR = prevDataDirEnv;
     try {
       rmSync(tempDir, { recursive: true, force: true });
     } catch {
@@ -221,6 +235,157 @@ describe('SettingsDefaultsManager', () => {
         expect(parsed.env).toBeUndefined();
         expect(parsed.CLAUDE_MEM_MODEL).toBe('migrated-model');
       });
+
+      it('should preserve peer root keys instead of flattening a mixed nested document', () => {
+        const nestedSettings = {
+          theme: 'dark',
+          permissions: { defaultMode: 'auto' },
+          env: {
+            CLAUDE_MEM_MODEL: 'nested-model',
+          },
+        };
+        writeFileSync(settingsPath, JSON.stringify(nestedSettings));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(result.CLAUDE_MEM_MODEL).toBe('nested-model');
+        const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        expect(parsed.theme).toBe('dark');
+        expect(parsed.permissions).toEqual({ defaultMode: 'auto' });
+        expect(parsed.env.CLAUDE_MEM_MODEL).toBe('nested-model');
+      });
+    });
+
+    // A fresh settings.json is seeded with every default, so installs created
+    // while 'security_alert' was the default have it frozen on disk. Without
+    // this migration a newly-added trigger type never reaches them.
+    describe('Telegram trigger types migration', () => {
+      it('should migrate the exact legacy default to the current default', () => {
+        writeFileSync(settingsPath, JSON.stringify({
+          CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: 'security_alert',
+        }));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(result.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES).toBe(
+          SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES
+        );
+        expect(result.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES.split(',')).toContain('sensitive');
+      });
+
+      it('should persist the migrated trigger types back to the file', () => {
+        writeFileSync(settingsPath, JSON.stringify({
+          CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: 'security_alert',
+          CLAUDE_MEM_TELEGRAM_CHAT_ID: '12345',
+        }));
+
+        SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        expect(parsed.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES.split(',')).toContain('sensitive');
+        // Unrelated persisted keys survive the rewrite.
+        expect(parsed.CLAUDE_MEM_TELEGRAM_CHAT_ID).toBe('12345');
+      });
+
+      it('should preserve a customized trigger list', () => {
+        writeFileSync(settingsPath, JSON.stringify({
+          CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: 'bugfix,decision',
+        }));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(result.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES).toBe('bugfix,decision');
+        const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        expect(parsed.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES).toBe('bugfix,decision');
+      });
+
+      it('should preserve a customized list that merely contains the legacy value', () => {
+        writeFileSync(settingsPath, JSON.stringify({
+          CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: 'security_alert,security_note',
+        }));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(result.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES).toBe('security_alert,security_note');
+      });
+
+      it('should leave an empty opt-out list alone', () => {
+        writeFileSync(settingsPath, JSON.stringify({
+          CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: '',
+        }));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(result.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES).toBe('');
+      });
+
+      it('should be idempotent across repeated loads', () => {
+        writeFileSync(settingsPath, JSON.stringify({
+          CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: 'security_alert',
+        }));
+
+        const first = SettingsDefaultsManager.loadFromFile(settingsPath);
+        const second = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(second.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES).toBe(first.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES);
+      });
+    });
+
+    // loadFromFile only carries keys declared in DEFAULTS, so before the Pro
+    // sign-in keys were declared, an installer-written settings.json lost
+    // them on every load (the round-trip-loss gap fixed by the install-first
+    // login flow plan, Phase 4).
+    describe('CMEM Pro sign-in keys round-trip', () => {
+      const proKeys = {
+        CLAUDE_MEM_PRO_TRIAL_EMAIL: 'dev@example.com',
+        CLAUDE_MEM_PRO_TRIAL_AT: '2026-08-26T12:00:00.000Z',
+        CLAUDE_MEM_PRO_TRIAL_STATE: 'active',
+        CLAUDE_MEM_PRO_TRIAL_ENDS_AT: '2026-09-02T12:00:00.000Z',
+        CLAUDE_MEM_PRO_PLAN: 'trial',
+        CLAUDE_MEM_PRO_MEMORY_KEY: 'cm_pro_staged_test_key',
+        CLAUDE_MEM_PRO_MEMORY_BASE_URL: 'https://cmem.ai/api/inference/v1',
+        CLAUDE_MEM_PRO_MEMORY_MODEL: 'cmem-observer',
+      };
+
+      it('should surface all Pro account and staged-memory keys from settings.json', () => {
+        writeFileSync(settingsPath, JSON.stringify(proKeys));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(result.CLAUDE_MEM_PRO_TRIAL_EMAIL).toBe('dev@example.com');
+        expect(result.CLAUDE_MEM_PRO_TRIAL_AT).toBe('2026-08-26T12:00:00.000Z');
+        expect(result.CLAUDE_MEM_PRO_TRIAL_STATE).toBe('active');
+        expect(result.CLAUDE_MEM_PRO_TRIAL_ENDS_AT).toBe('2026-09-02T12:00:00.000Z');
+        expect(result.CLAUDE_MEM_PRO_PLAN).toBe('trial');
+        expect(result.CLAUDE_MEM_PRO_MEMORY_KEY).toBe('cm_pro_staged_test_key');
+        expect(result.CLAUDE_MEM_PRO_MEMORY_BASE_URL).toBe('https://cmem.ai/api/inference/v1');
+        expect(result.CLAUDE_MEM_PRO_MEMORY_MODEL).toBe('cmem-observer');
+      });
+
+      it('should default all Pro account and staged-memory keys to empty strings', () => {
+        const defaults = SettingsDefaultsManager.getAllDefaults();
+
+        expect(defaults.CLAUDE_MEM_PRO_TRIAL_EMAIL).toBe('');
+        expect(defaults.CLAUDE_MEM_PRO_TRIAL_AT).toBe('');
+        expect(defaults.CLAUDE_MEM_PRO_TRIAL_STATE).toBe('');
+        expect(defaults.CLAUDE_MEM_PRO_TRIAL_ENDS_AT).toBe('');
+        expect(defaults.CLAUDE_MEM_PRO_PLAN).toBe('');
+        expect(defaults.CLAUDE_MEM_PRO_MEMORY_KEY).toBe('');
+        expect(defaults.CLAUDE_MEM_PRO_MEMORY_BASE_URL).toBe('');
+        expect(defaults.CLAUDE_MEM_PRO_MEMORY_MODEL).toBe('');
+      });
+
+      it('should keep the Pro keys on disk when loading rewrites the file (nested-schema migration)', () => {
+        writeFileSync(settingsPath, JSON.stringify({ env: proKeys }));
+
+        const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(result.CLAUDE_MEM_PRO_TRIAL_STATE).toBe('active');
+        const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        expect(parsed.CLAUDE_MEM_PRO_TRIAL_EMAIL).toBe('dev@example.com');
+        expect(parsed.CLAUDE_MEM_PRO_PLAN).toBe('trial');
+        expect(parsed.CLAUDE_MEM_PRO_MEMORY_KEY).toBe('cm_pro_staged_test_key');
+      });
     });
 
     describe('edge cases', () => {
@@ -255,6 +420,61 @@ describe('SettingsDefaultsManager', () => {
 
         expect(result).toBeDefined();
       });
+
+      it('should read BOM-prefixed flat settings through install helpers', () => {
+        writeFileSync(settingsPath, '\uFEFF' + JSON.stringify({
+          env: {
+            CLAUDE_MEM_PROVIDER: 'gemini',
+          },
+        }));
+
+        const result = readFlatSettings(settingsPath);
+
+        expect(result?.CLAUDE_MEM_PROVIDER).toBe('gemini');
+      });
+
+      it('should create defaults without leaving atomic temp files behind', () => {
+        expect(existsSync(settingsPath)).toBe(false);
+
+        SettingsDefaultsManager.loadFromFile(settingsPath);
+
+        expect(existsSync(settingsPath)).toBe(true);
+        expect(readdirSync(tempDir).filter(name => name.endsWith('.tmp'))).toEqual([]);
+      });
+    });
+  });
+
+  describe('stdout discipline', () => {
+    // CLI commands like `start` promise machine-readable JSON on stdout to
+    // the hook framework; settings bootstrap runs inside them, so its
+    // informational notices must go to stderr. PR #2894 CI caught the
+    // creation notice corrupting the start command's JSON on first boot in
+    // a fresh data dir.
+    it('should not write to stdout when creating the settings file', () => {
+      const stdoutCalls: unknown[][] = [];
+      const originalLog = console.log;
+      console.log = (...args: unknown[]) => { stdoutCalls.push(args); };
+      try {
+        expect(existsSync(settingsPath)).toBe(false);
+        SettingsDefaultsManager.loadFromFile(settingsPath);
+        expect(existsSync(settingsPath)).toBe(true);
+        expect(stdoutCalls).toEqual([]);
+      } finally {
+        console.log = originalLog;
+      }
+    });
+
+    it('should not write to stdout when migrating a nested-schema file', () => {
+      writeFileSync(settingsPath, JSON.stringify({ env: { CLAUDE_MEM_MODEL: 'nested-model' } }));
+      const stdoutCalls: unknown[][] = [];
+      const originalLog = console.log;
+      console.log = (...args: unknown[]) => { stdoutCalls.push(args); };
+      try {
+        SettingsDefaultsManager.loadFromFile(settingsPath);
+        expect(stdoutCalls).toEqual([]);
+      } finally {
+        console.log = originalLog;
+      }
     });
   });
 
@@ -285,7 +505,7 @@ describe('SettingsDefaultsManager', () => {
 
   describe('get', () => {
     it('should return default value for key', () => {
-      expect(SettingsDefaultsManager.get('CLAUDE_MEM_MODEL')).toBe('claude-sonnet-4-6');
+      expect(SettingsDefaultsManager.get('CLAUDE_MEM_MODEL')).toBe('claude-haiku-4-5-20251001');
       const expectedPort = String(37700 + ((process.getuid?.() ?? 77) % 100));
       expect(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')).toBe(expectedPort);
     });
@@ -296,16 +516,6 @@ describe('SettingsDefaultsManager', () => {
       const expectedPort = 37700 + ((process.getuid?.() ?? 77) % 100);
       expect(SettingsDefaultsManager.getInt('CLAUDE_MEM_WORKER_PORT')).toBe(expectedPort);
       expect(SettingsDefaultsManager.getInt('CLAUDE_MEM_CONTEXT_OBSERVATIONS')).toBe(50);
-    });
-  });
-
-  describe('getBool', () => {
-    it('should return true for "true" string', () => {
-      expect(SettingsDefaultsManager.getBool('CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT')).toBe(true);
-    });
-
-    it('should return false for non-"true" string', () => {
-      expect(SettingsDefaultsManager.getBool('CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE')).toBe(false);
     });
   });
 

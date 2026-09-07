@@ -1,10 +1,10 @@
-
 import express, { Request, Response } from 'express';
 import { z } from 'zod';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { validateBody } from '../middleware/validateBody.js';
 import { logger } from '../../../../utils/logger.js';
 import type { DatabaseManager } from '../../DatabaseManager.js';
+import '../../../sqlite/manual-session.js';
 
 const saveMemorySchema = z.object({
   text: z.string().trim().min(1),
@@ -33,12 +33,15 @@ export class MemoryRoutes extends BaseRouteHandler {
     const metadataProject = typeof metadata?.project === 'string' && metadata.project.trim()
       ? metadata.project.trim()
       : undefined;
+    const metadataPlatformSource = typeof metadata?.platformSource === 'string' && metadata.platformSource.trim()
+      ? metadata.platformSource.trim()
+      : undefined;
     const targetProject = explicitProject || metadataProject || this.defaultProject;
 
     const sessionStore = this.dbManager.getSessionStore();
     const chromaSync = this.dbManager.getChromaSync();
 
-    const memorySessionId = sessionStore.getOrCreateManualSession(targetProject);
+    const memorySessionId = sessionStore.getOrCreateManualSession(targetProject, metadataPlatformSource);
 
     const observation = {
       type: 'discovery',  // Use existing valid type
@@ -66,6 +69,11 @@ export class MemoryRoutes extends BaseRouteHandler {
       title: observation.title
     });
 
+    // Fire-and-forget cloud sync nudge — every local write must nudge
+    // (placed before the chroma branch so the chroma-disabled early return
+    // cannot skip it).
+    this.dbManager.getCloudSync()?.notify();
+
     if (!chromaSync) {
       logger.debug('CHROMA', 'ChromaDB sync skipped (chromaSync not available)', { id: result.id });
       res.json({
@@ -83,8 +91,7 @@ export class MemoryRoutes extends BaseRouteHandler {
       targetProject,
       observation,
       0,
-      result.createdAtEpoch,
-      0
+      result.createdAtEpoch
     ).catch(err => {
       logger.error('CHROMA', 'ChromaDB sync failed', { id: result.id }, err as Error);
     });
